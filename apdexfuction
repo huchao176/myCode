@@ -1,0 +1,279 @@
+-- FUNCTION: stapuser.func_getapdexqualifieddata(text, text, integer, double precision, integer, integer)
+
+-- DROP FUNCTION IF EXISTS stapuser.func_getapdexqualifieddata(text, text, integer, double precision, integer, integer);
+
+CREATE OR REPLACE FUNCTION stapuser.func_getapdexqualifieddata(
+	p_service text,
+	p_comp_feature text,
+	sum_total integer DEFAULT 500,
+	p_apdex double precision DEFAULT 1,
+	p_frustrated integer DEFAULT 0,
+	p_com_tolerate integer DEFAULT 0)
+    RETURNS SETOF apdex_alert_type 
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+    ROWS 1000
+
+AS $BODY$
+DECLARE
+    cur_startdate timestamp;
+    cur_enddate   timestamp;
+    --vsqlerr           VARCHAR(516);
+    total_tolerated    bigint := 0;
+    total_frustrated   bigint := 0;
+    total_success      bigint := 0;
+    total_count        bigint := 0;
+    total_apdex_score  real := 0;
+    max_loop           smallint := 10;
+    ite_cnt            smallint;
+    comp_feature_array comp_feature_type[];
+    cur_comp_feature   varchar(4000) := p_comp_feature;
+    interval_num       bigint := 60;
+    ing_starttime      timestamp;
+    ing_endtime        timestamp;
+    total_impact_mins  bigint := 0;
+	v_es_dc            varchar(100);
+	v_text1 text;
+    v_text2 text;
+	env varchar(100):='Commercial';
+	frustrated_link character varying(1000);
+	rootcause_link character varying(1000);
+	impact_link character varying(1000);
+	stapvip     varchar(100);
+	starttime_str character varying(50);
+	endtime_str character varying(50);
+	apdex_precise smallint:= case when scale(p_apdex::numeric) > 0 then scale(p_apdex::numeric) + 1 else 2 end;
+    c_apdex CURSOR FOR
+      SELECT t.service,
+             t.component,
+             t.shard,
+             t.feature,
+             SUM(tolerating) tolerated,
+             SUM(frustrated) frustrated,
+             SUM(satisfied) success,
+             SUM(tolerating + frustrated + satisfied) count,
+             0 apdex_score,
+			 max(coalesce(t.es_dc,'_ALL')) es_dc,
+			 max(case when frustrated > 0 then t.es_dc else null end) v_es_dc,
+             max(coalesce(coalesce(d.dcname,e.dcname),f.dcname)) dc,
+             max(t.interval) "interval",
+             starttime,
+             endtime,
+			 round(sum(case when apdex_score < p_apdex and (case when p_com_tolerate=1 then (tolerating + frustrated) > 0 else frustrated > 0 end) then t.interval else 0 end)/60) impact_mins,
+             max(timestamp) max_timestamp,
+             min(timestamp) min_timestamp
+		from (select l.service,l.component,l.feature,l.shard,timestamp,tolerating,frustrated,satisfied,(tolerating + frustrated + satisfied) total,es_dc,interval,trim_shard,starttime,endtime,
+			(CASE WHEN (tolerating + frustrated + satisfied) = 0 THEN 1 ELSE round(cast((satisfied + tolerating / 2) as numeric) / (satisfied + tolerating + frustrated) , apdex_precise) END) as apdex_score
+			FROM (SELECT service,
+						 component,
+						 feature,
+						 shard,
+						 regexp_replace(regexp_replace(SUBSTRING (shard FROM '[^_^-]+'),'E(\w+)MD','\1'),'(DT)?D?([0-9a-zA-Z]*)WD','\1\2') trim_shard,
+						 /*max(timestamp) - INTERVAL'3 min' starttime,
+						 max(timestamp) endtime,*/
+						 to_timestamp(trunc(extract(epoch from max(timestamp))/180)*180) - (case when max(interval) > 3*60 then INTERVAL'0 min' else INTERVAL'3 min' end) starttime,
+						 to_timestamp(trunc(extract(epoch from max(timestamp))/180)*180) + (case when max(interval) > 3*60 then INTERVAL'3 min' else INTERVAL'0 min' end) endtime
+					FROM stap_apdex3 t
+					WHERE service = p_service
+					  AND (component, feature) IN (select component,feature_name from unnest(comp_feature_array))
+					  and timestamp > now() - INTERVAL'20 day'
+				   group by service, component, feature, shard) l
+        JOIN stap_apdex3 x
+          ON x.service = l.service
+         and x.component = l.component
+         and x.feature = l.feature
+         and x.shard = l.shard
+         and x.timestamp >= l.starttime
+         and x.timestamp < l.endtime
+		) t
+        left join stap_du_dcpools D
+            ON t.shard = D.poolname
+		left join stap_av_locationmapping e
+			ON t.trim_shard = upper(e.aliasname)
+        left join stap_du_dcpools F
+			ON t.shard = F.poolname
+       WHERE position('_ERROR' in t.shard) = 0
+       GROUP BY t.service,
+                t.component,
+                t.shard,
+                t.feature,
+                starttime,
+                endtime;
+    apdex_rec record;
+	cur1 record;
+    cur_his record;
+    his_date timestamp;
+    histable recordtype[];
+
+BEGIN
+	RAISE NOTICE 'i want to print % and %', p_service,p_comp_feature;
+	RAISE NOTICE 'i want to print apdex_precise %', apdex_precise;
+
+     select array_agg(t)
+      into comp_feature_array
+      from(select SPLIT_PART(str, '|', 1) component,SPLIT_PART(str, '|', 2) feature
+      from unnest(string_to_array(cur_comp_feature, ',')) str) t;
+
+      select array_agg(t1)
+      into histable
+      from(SELECT max(STARTTIME) STARTTIME,
+             max(ENDTIME) ENDTIME,
+		     max(ES_DC) ES_DC,
+             SERVICE,
+             COMPONENT,
+             FEATURE,
+             SHARD
+            from stap_apdex_alerts h
+            where h.runtime > now() - INTERVAL'60 min'
+       AND service = p_service
+         AND (component, feature) IN (select component,feature_name from unnest(comp_feature_array))
+       group by SERVICE, COMPONENT, FEATURE, SHARD) t1  ;
+
+	open c_apdex;
+    LOOP
+	  FETCH FROM c_apdex INTO cur1;
+      EXIT WHEN NOT FOUND;
+      cur_startdate    := cur1.starttime;
+      cur_enddate      := cur1.endtime;
+      total_tolerated  := cur1.tolerated;
+      total_frustrated := cur1.frustrated;
+      total_success    := cur1.success;
+      total_count      := cur1.count;
+      ite_cnt          := 1;
+      interval_num     := cur1.interval;
+      his_date         := null;
+	  total_impact_mins := cur1.impact_mins;
+      v_es_dc           := cur1.v_es_dc;
+	  ing_starttime     := cur1.min_timestamp;
+      ing_endtime       := cur1.max_timestamp + (interval_num || ' second')::INTERVAL;
+	  env               :=(case when position('FEDRAMP' in upper(v_es_dc)) > 0 then 'FedRAMP' when position('BT' in upper(v_es_dc)) > 0 then 'BTS' else 'Commercial' end);
+
+	  	RAISE NOTICE 'i want to print2 % and %', cur_startdate,cur_enddate;
+
+      FOR cur_his IN select STARTTIME,ENDTIME,SERVICE,COMPONENT,FEATURE,SHARD from unnest(histable) LOOP
+        BEGIN
+          IF cur1.service = cur_his.service AND
+             cur1.component = cur_his.component AND
+             cur1.feature = cur_his.feature AND
+             cur1.shard = cur_his.shard THEN
+            his_date := TO_DATE(cur_his.endtime,'YYYY-MM-DD"T"HH24:MI');
+            EXIT;
+          END IF;
+        EXCEPTION
+          WHEN others then
+            NULL;
+        END;
+      END LOOP;
+
+       IF his_date IS NOT NULL AND his_date > ing_starttime THEN
+         CONTINUE;
+      END IF;
+      WHILE total_count < sum_total LOOP
+        ite_cnt       := ite_cnt + 1;
+        cur_startdate := cur_startdate - INTERVAL'3 min';
+        cur_enddate   := cur_enddate - INTERVAL'3 min';
+
+        BEGIN
+          SELECT '' service,
+                 '' component,
+                 '' shard,
+                 '' feature,
+                 SUM(tolerating) tolerated,
+                 SUM(frustrated) frustrated,
+                 SUM(satisfied) success,
+                 SUM(tolerating + frustrated + satisfied) count,
+                 0 apdex_score,
+                 '' es_dc,
+				 max(case when frustrated > 0 then t.es_dc else null end) v_es_dc,
+                 '' dc,
+                 0 "interval",
+                 null starttime,
+                 null endtime,
+				 round(sum(case when apdex_score < p_apdex and (case when p_com_tolerate=1 then (tolerating + frustrated) > 0 else frustrated > 0 end) then t.interval else 0 end)/60) impact_mins,
+                 max(timestamp) max_timestamp,
+                 min(timestamp) min_timestamp
+            into STRICT apdex_rec
+            FROM (select service,component,feature,shard,timestamp,tolerating,frustrated,satisfied,(tolerating + frustrated + satisfied) total,es_dc,interval,
+				   (CASE WHEN (tolerating + frustrated + satisfied) = 0 THEN 1 ELSE round(cast((satisfied + tolerating / 2) as numeric) / (satisfied + tolerating + frustrated) , apdex_precise) END) as apdex_score
+					 FROM stap_apdex3 x
+				   WHERE service = cur1.service
+					 AND component = cur1.component
+					 AND feature = cur1.feature
+					 AND shard = cur1.shard
+					 AND timestamp >= cur_startdate
+					 AND timestamp < cur_enddate
+				 ) t;
+        EXCEPTION
+          WHEN no_data_found THEN
+            EXIT;
+          WHEN others then
+            EXIT;
+        END;
+		
+		IF his_date IS NOT NULL AND apdex_rec.min_timestamp is not null AND his_date > apdex_rec.min_timestamp THEN
+           EXIT;
+        END IF;
+		
+        IF (apdex_rec.count IS NOT NULL AND apdex_rec.count::text <> '') THEN
+          total_tolerated  := total_tolerated + apdex_rec.tolerated;
+          total_frustrated := total_frustrated + apdex_rec.frustrated;
+          total_success    := total_success + apdex_rec.success;
+          total_count      := total_count + apdex_rec.count;
+		  total_impact_mins := total_impact_mins + apdex_rec.impact_mins;
+          v_es_dc           := COALESCE(v_es_dc,apdex_rec.v_es_dc);
+		  ing_starttime     := apdex_rec.min_timestamp;
+        END IF;
+        IF ite_cnt >= max_loop THEN
+          EXIT;
+        END IF;
+      END LOOP;
+
+       /*ing_endtime := cur1.endtime + (interval_num || ' second')::INTERVAL;
+       ing_starttime := cur1.endtime;
+       WHILE ing_starttime > cur_startdate LOOP
+         ing_starttime := ing_starttime - (interval_num || ' second')::INTERVAL;
+       END LOOP;
+       ing_starttime := ing_starttime + (interval_num || ' second')::INTERVAL;*/
+	   
+	  starttime_str:= to_char(ing_starttime, 'yyyy-mm-dd"T"hh24:mi');
+	  endtime_str  := to_char(ing_endtime, 'yyyy-mm-dd"T"hh24:mi');
+	  total_apdex_score:=(CASE WHEN total_count = 0 THEN 1 ELSE round(cast((total_success + total_tolerated / 2) as numeric) / (total_success + total_tolerated + total_frustrated) , apdex_precise) END);
+	  stapvip:= (case when position('FEDRAMP' in upper(v_es_dc)) > 0 then 'stap2' else 'stap' end);
+	  frustrated_link:= 'https://' || stapvip || '.webex.com/doJumpUrl.action?dcname=' || upper(v_es_dc) || '&&esurl=common_kibanaurl&&datatype=frustrated&&service=' || cur1.service || '&&component=' || cur1.component || '&&feature=' || cur1.feature || '&&start=' || starttime_str || '&&end=' || endtime_str || '&&shard=' || cur1.shard;
+      rootcause_link:=  'https://' || stapvip || '.webex.com/jsp/platform/apdex/apdexRCA.jsp?dcname=' || upper(v_es_dc) || '&&esurl=common_elsurl&&datatype=frustrated&&service=' || cur1.service || '&&component=' || cur1.component || '&&feature=' || cur1.feature || '&&start=' || starttime_str || '&&end=' || endtime_str || '&&shard=' || cur1.shard;
+      impact_link:=     'https://' || stapvip || '.webex.com/jsp/platform/apdex/apdexKeyInfo.jsp?dcname=' || upper(v_es_dc) || '&&esurl=common_elsurl&&datatype=frustrated&&service=' || cur1.service || '&&component=' || cur1.component || '&&feature=' || cur1.feature || '&&start=' || starttime_str || '&&end=' || endtime_str || '&&shard=' || cur1.shard;
+      RETURN next ROW(env,
+					  cur1.service,
+					  cur1.component,
+					  cur1.feature,
+					  cur1.shard,
+					  total_tolerated,
+					  total_frustrated,
+					  total_success,
+					  total_count,
+					  total_apdex_score,
+					  ing_starttime,
+					  ing_endtime,
+					  upper(v_es_dc),
+					  cur1.dc,
+					  total_impact_mins,
+					  frustrated_link,
+					  rootcause_link,
+					  impact_link)::apdex_alert_type;
+--       tab_apdex[tab_apdex.count] := apdex_obj;
+
+    END LOOP;
+    CLOSE c_apdex;
+    RETURN;
+  EXCEPTION
+    WHEN OTHERS THEN GET STACKED DIAGNOSTICS
+	   v_text1= MESSAGE_TEXT,
+       v_text2=PG_EXCEPTION_CONTEXT;
+      raise notice 'Exception:%,%',v_text1,v_text2;
+      RETURN;
+  END;
+$BODY$;
+
+ALTER FUNCTION stapuser.func_getapdexqualifieddata(text, text, integer, double precision, integer, integer)
+    OWNER TO stapuser;
