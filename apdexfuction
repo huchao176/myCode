@@ -10,7 +10,7 @@ CREATE OR REPLACE FUNCTION stapuser.func_getapdexqualifieddata(
 	p_frustrated integer DEFAULT 0,
 	p_com_tolerate integer DEFAULT 0)
     RETURNS SETOF apdex_alert_type 
-    LANGUAGE 'plpgsql'
+    LANGUAGE 'plpgsql'1111111
     COST 100
     VOLATILE PARALLEL UNSAFE
     ROWS 1000
